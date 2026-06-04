@@ -1,0 +1,10 @@
+.venv/
+__pycache__/
+*.pyc
+
+challenge.zip
+challenge_data/
+upstream_challenge/
+submission/
+haensel_ams_attribution_submission.zip
+outputs/ihc_*json
