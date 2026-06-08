@@ -32,6 +32,8 @@ class PipelineConfig:
     max_journeys_per_request: int = 100
     max_sessions_per_request: int = 200
     request_sleep_seconds: float = 0.0
+    api_max_retries: int = 3
+    api_retry_backoff_seconds: float = 1.0
 
 
 def connect(db_path: Path) -> sqlite3.Connection:
@@ -161,33 +163,57 @@ def compute_attribution(config: PipelineConfig, journeys: pd.DataFrame) -> pd.Da
         max_sessions=config.max_sessions_per_request,
     ):
         payload = {"customer_journeys": chunk.to_dict(orient="records")}
-        results.extend(call_ihc_api(config.api_key, config.conv_type_id, payload))
+        results.extend(
+            call_ihc_api(
+                config.api_key,
+                config.conv_type_id,
+                payload,
+                max_retries=config.api_max_retries,
+                retry_backoff_seconds=config.api_retry_backoff_seconds,
+            )
+        )
         if config.request_sleep_seconds:
             time.sleep(config.request_sleep_seconds)
 
     return pd.DataFrame(results)[["conversion_id", "session_id", "ihc"]]
 
 
-def call_ihc_api(api_key: str, conv_type_id: str, payload: dict) -> list[dict]:
+def call_ihc_api(
+    api_key: str,
+    conv_type_id: str,
+    payload: dict,
+    max_retries: int = 3,
+    retry_backoff_seconds: float = 1.0,
+) -> list[dict]:
     path = f"{API_PATH}?conv_type_id={urllib.parse.quote(conv_type_id)}"
-    connection = http.client.HTTPSConnection(API_HOST, timeout=60)
-    try:
-        connection.request(
-            "POST",
-            path,
-            body=json.dumps(payload),
-            headers={
-                "Content-Type": "application/json",
-                "x-api-key": api_key,
-            },
-        )
-        response = connection.getresponse()
-        detail = response.read().decode("utf-8", errors="replace")
-    finally:
-        connection.close()
+    response_status = 0
+    detail = ""
 
-    if response.status >= 400:
-        raise RuntimeError(f"IHC API request failed with HTTP {response.status}: {detail}")
+    for attempt in range(max_retries + 1):
+        connection = http.client.HTTPSConnection(API_HOST, timeout=60)
+        try:
+            connection.request(
+                "POST",
+                path,
+                body=json.dumps(payload),
+                headers={
+                    "Content-Type": "application/json",
+                    "x-api-key": api_key,
+                },
+            )
+            response = connection.getresponse()
+            response_status = response.status
+            detail = response.read().decode("utf-8", errors="replace")
+        finally:
+            connection.close()
+
+        if response_status not in (429, 500, 502, 503, 504):
+            break
+        if attempt < max_retries:
+            time.sleep(retry_backoff_seconds * (2**attempt))
+
+    if response_status >= 400:
+        raise RuntimeError(f"IHC API request failed with HTTP {response_status}: {detail}")
 
     body = json.loads(detail)
 
@@ -226,21 +252,40 @@ def write_attribution_results(config: PipelineConfig, attribution: pd.DataFrame)
 
 def refresh_channel_reporting(config: PipelineConfig) -> None:
     query = """
+        WITH session_cost_by_channel AS (
+            SELECT
+                ss.channel_name,
+                ss.event_date AS date,
+                SUM(COALESCE(sc.cost, 0.0)) AS cost
+            FROM session_sources ss
+            LEFT JOIN session_costs sc
+                ON sc.session_id = ss.session_id
+            GROUP BY ss.channel_name, ss.event_date
+        ),
+        attribution_by_channel AS (
+            SELECT
+                ss.channel_name,
+                ss.event_date AS date,
+                SUM(acj.ihc) AS ihc,
+                SUM(acj.ihc * c.revenue) AS ihc_revenue
+            FROM attribution_customer_journey acj
+            JOIN session_sources ss
+                ON ss.session_id = acj.session_id
+            JOIN conversions c
+                ON c.conv_id = acj.conv_id
+            GROUP BY ss.channel_name, ss.event_date
+        )
         INSERT INTO channel_reporting (channel_name, date, cost, ihc, ihc_revenue)
         SELECT
-            ss.channel_name,
-            ss.event_date AS date,
-            SUM(COALESCE(sc.cost, 0.0)) AS cost,
-            SUM(acj.ihc) AS ihc,
-            SUM(acj.ihc * c.revenue) AS ihc_revenue
-        FROM attribution_customer_journey acj
-        JOIN session_sources ss
-            ON ss.session_id = acj.session_id
-        LEFT JOIN session_costs sc
-            ON sc.session_id = acj.session_id
-        JOIN conversions c
-            ON c.conv_id = acj.conv_id
-        GROUP BY ss.channel_name, ss.event_date
+            costs.channel_name,
+            costs.date,
+            costs.cost,
+            COALESCE(attribution.ihc, 0.0) AS ihc,
+            COALESCE(attribution.ihc_revenue, 0.0) AS ihc_revenue
+        FROM session_cost_by_channel costs
+        LEFT JOIN attribution_by_channel attribution
+            ON attribution.channel_name = costs.channel_name
+           AND attribution.date = costs.date
     """
 
     with connect(config.db_path) as connection:

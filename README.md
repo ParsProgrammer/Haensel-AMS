@@ -7,8 +7,7 @@ This is a Python solution for the Haensel AMS data engineering challenge. It rea
 ```powershell
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
-pip install -r requirements.txt
-$env:PYTHONPATH = "src"
+pip install -e ".[dev]"
 ```
 
 The challenge assets are expected at:
@@ -23,8 +22,7 @@ Create a free IHC account, then set the credentials provided by IHC:
 ```powershell
 $env:IHC_API_KEY = "your-api-key"
 $env:IHC_CONV_TYPE_ID = "your-conversion-type-id"
-$env:PYTHONPATH = "src"
-python -m attribution_pipeline.cli
+haensel-attribution
 ```
 
 ## Run Locally Without API Credentials
@@ -32,7 +30,7 @@ python -m attribution_pipeline.cli
 For development and validation only, the pipeline can compute equal-split attribution per conversion:
 
 ```powershell
-python -m attribution_pipeline.cli --offline-attribution
+haensel-attribution --offline-attribution
 ```
 
 The output CSV is written to `outputs/channel_reporting.csv`.
@@ -42,7 +40,13 @@ The output CSV is written to `outputs/channel_reporting.csv`.
 The pipeline accepts a conversion time range. `--start-date` is inclusive and `--end-date` is exclusive.
 
 ```powershell
-python -m attribution_pipeline.cli --start-date 2023-09-01 --end-date 2023-09-04
+haensel-attribution --start-date 2023-09-01 --end-date 2023-09-04
+```
+
+## Tests
+
+```powershell
+pytest
 ```
 
 ## Pipeline Steps
@@ -52,5 +56,5 @@ python -m attribution_pipeline.cli --start-date 2023-09-01 --end-date 2023-09-04
 3. Transform each journey into IHC API records.
 4. Chunk API calls by the documented journey limit and the observed free-plan limit of 200 sessions per request.
 5. Write `conversion_id`, `session_id`, and `ihc` into `attribution_customer_journey`.
-6. Aggregate channel/date cost, IHC orders, and IHC revenue into `channel_reporting`.
+6. Aggregate total channel/date session cost, IHC orders, and IHC revenue into `channel_reporting`.
 7. Export `channel_reporting` with calculated `CPO = cost / ihc` and `ROAS = ihc_revenue / cost`.
